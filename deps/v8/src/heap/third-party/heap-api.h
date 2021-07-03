@@ -26,6 +26,12 @@ class Heap {
 
   const base::AddressRegion& GetCodeRange();
 
+  bool IsPendingAllocation(HeapObject object);
+
+  static bool InSpace(Address address, AllocationSpace space);
+
+  static bool InOldSpace(Address address);
+
   static bool InCodeSpace(Address address);
 
   static bool InReadOnlySpace(Address address);
@@ -34,10 +40,14 @@ class Heap {
 
   static bool IsValidHeapObject(HeapObject object);
 
+  static bool IsImmovable(HeapObject object);
+
   void ResetIterator();
   HeapObject NextObject();
 
   bool CollectGarbage();
+
+  size_t Capacity();
 };
 
 }  // namespace third_party_heap

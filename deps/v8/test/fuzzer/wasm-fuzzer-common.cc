@@ -38,7 +38,7 @@ void InterpretAndExecuteModule(i::Isolate* isolate,
   // Try to instantiate, return if it fails.
   {
     ErrorThrower thrower(isolate, "WebAssembly Instantiation");
-    if (!isolate->wasm_engine()
+    if (!GetWasmEngine()
              ->SyncInstantiate(isolate, &thrower, module_object, {},
                                {})  // no imports & memory
              .ToHandle(&instance)) {
@@ -55,7 +55,7 @@ void InterpretAndExecuteModule(i::Isolate* isolate,
     return;
   }
 
-  OwnedVector<WasmValue> arguments =
+  base::OwnedVector<WasmValue> arguments =
       testing::MakeDefaultInterpreterArguments(isolate, main_function->sig());
 
   // Now interpret.
@@ -77,13 +77,13 @@ void InterpretAndExecuteModule(i::Isolate* isolate,
   {
     ErrorThrower thrower(isolate, "Second Instantiation");
     // We instantiated before, so the second instantiation must also succeed:
-    CHECK(isolate->wasm_engine()
+    CHECK(GetWasmEngine()
               ->SyncInstantiate(isolate, &thrower, module_object, {},
                                 {})  // no imports & memory
               .ToHandle(&instance));
   }
 
-  OwnedVector<Handle<Object>> compiled_args =
+  base::OwnedVector<Handle<Object>> compiled_args =
       testing::MakeDefaultArguments(isolate, main_function->sig());
 
   bool exception = false;
@@ -158,6 +158,64 @@ struct PrintName {
 std::ostream& operator<<(std::ostream& os, const PrintName& name) {
   return os.write(name.name.begin(), name.name.size());
 }
+
+std::ostream& operator<<(std::ostream& os, WasmElemSegment::Entry entry) {
+  os << "WasmInitExpr.";
+  switch (entry.kind) {
+    case WasmElemSegment::Entry::kGlobalGetEntry:
+      os << "GlobalGet(" << entry.index;
+      break;
+    case WasmElemSegment::Entry::kRefFuncEntry:
+      os << "RefFunc(" << entry.index;
+      break;
+    case WasmElemSegment::Entry::kRefNullEntry:
+      os << "RefNull(" << HeapType(entry.index).name().c_str();
+      break;
+  }
+  return os << ")";
+}
+
+// Appends an initializer expression encoded in {wire_bytes}, in the offset
+// contained in {expr}.
+// TODO(7748): Find a way to implement other expressions here.
+void AppendInitExpr(std::ostream& os, ModuleWireBytes wire_bytes,
+                    WireBytesRef expr) {
+  Decoder decoder(wire_bytes.module_bytes());
+  const byte* pc = wire_bytes.module_bytes().begin() + expr.offset();
+  uint32_t length;
+  os << "WasmInitExpr.";
+  switch (static_cast<WasmOpcode>(pc[0])) {
+    case kExprGlobalGet:
+      os << "GlobalGet("
+         << decoder.read_u32v<Decoder::kNoValidation>(pc + 1, &length);
+      break;
+    case kExprI32Const:
+      os << "I32Const("
+         << decoder.read_i32v<Decoder::kNoValidation>(pc + 1, &length);
+      break;
+    case kExprI64Const:
+      os << "I64Const("
+         << decoder.read_i64v<Decoder::kNoValidation>(pc + 1, &length);
+      break;
+    case kExprF32Const: {
+      uint32_t result = decoder.read_u32<Decoder::kNoValidation>(pc + 1);
+      os << "F32Const(" << bit_cast<float>(result);
+      break;
+    }
+    case kExprF64Const: {
+      uint64_t result = decoder.read_u64<Decoder::kNoValidation>(pc + 1);
+      os << "F64Const(" << bit_cast<double>(result);
+      break;
+    }
+    case kExprRefFunc:
+      os << "RefFunc("
+         << decoder.read_u32v<Decoder::kNoValidation>(pc + 1, &length);
+      break;
+    default:
+      UNREACHABLE();
+  }
+  os << ")";
+}
 }  // namespace
 
 void GenerateTestCase(Isolate* isolate, ModuleWireBytes wire_bytes,
@@ -168,7 +226,7 @@ void GenerateTestCase(Isolate* isolate, ModuleWireBytes wire_bytes,
       enabled_features, wire_bytes.start(), wire_bytes.end(), kVerifyFunctions,
       ModuleOrigin::kWasmOrigin, isolate->counters(),
       isolate->metrics_recorder(), v8::metrics::Recorder::ContextId::Empty(),
-      DecodingMethod::kSync, isolate->wasm_engine()->allocator());
+      DecodingMethod::kSync, GetWasmEngine()->allocator());
   CHECK(module_res.ok());
   WasmModule* module = module_res.value().get();
   CHECK_NOT_NULL(module);
@@ -213,7 +271,9 @@ void GenerateTestCase(Isolate* isolate, ModuleWireBytes wire_bytes,
 
   for (WasmGlobal& glob : module->globals) {
     os << "builder.addGlobal(" << ValueTypeToConstantName(glob.type) << ", "
-       << glob.mutability << ");\n";
+       << glob.mutability << ", ";
+    AppendInitExpr(os, wire_bytes, glob.init);
+    os << ");\n";
   }
 
   // TODO(7748): Support array/struct types.
@@ -231,6 +291,8 @@ void GenerateTestCase(Isolate* isolate, ModuleWireBytes wire_bytes,
   Zone tmp_zone(isolate->allocator(), ZONE_NAME);
 
   // There currently cannot be more than one table.
+  // TODO(manoskouk): Add support for more tables.
+  // TODO(9495): Add support for talbes with explicit initializers.
   DCHECK_GE(1, module->tables.size());
   for (const WasmTable& table : module->tables) {
     os << "builder.setTableBounds(" << table.initial_size << ", ";
@@ -241,23 +303,28 @@ void GenerateTestCase(Isolate* isolate, ModuleWireBytes wire_bytes,
     }
   }
   for (const WasmElemSegment& elem_segment : module->elem_segments) {
-    os << "builder.addElementSegment(";
-    os << elem_segment.table_index << ", ";
-    switch (elem_segment.offset.kind()) {
-      case WasmInitExpr::kGlobalGet:
-        os << elem_segment.offset.immediate().index << ", true";
-        break;
-      case WasmInitExpr::kI32Const:
-        os << elem_segment.offset.immediate().i32_const << ", false";
-        break;
-      default:
-        UNREACHABLE();
+    const char* status_str =
+        elem_segment.status == WasmElemSegment::kStatusActive
+            ? "Active"
+            : elem_segment.status == WasmElemSegment::kStatusPassive
+                  ? "Passive"
+                  : "Declarative";
+    os << "builder.add" << status_str << "ElementSegment(";
+    if (elem_segment.status == WasmElemSegment::kStatusActive) {
+      os << elem_segment.table_index << ", ";
+      AppendInitExpr(os, wire_bytes, elem_segment.offset);
+      os << ", ";
     }
-    os << ", " << PrintCollection(elem_segment.entries) << ");\n";
+    os << "[";
+    for (uint32_t i = 0; i < elem_segment.entries.size(); i++) {
+      os << elem_segment.entries[i];
+      if (i < elem_segment.entries.size() - 1) os << ", ";
+    }
+    os << "], " << ValueTypeToConstantName(elem_segment.type) << ");\n";
   }
 
   for (const WasmFunction& func : module->functions) {
-    Vector<const uint8_t> func_code = wire_bytes.GetFunctionBytes(&func);
+    base::Vector<const uint8_t> func_code = wire_bytes.GetFunctionBytes(&func);
     os << "// Generate function " << (func.func_index + 1) << " (out of "
        << module->functions.size() << ").\n";
 
@@ -321,7 +388,7 @@ void OneTimeEnableStagedWasmFeatures(v8::Isolate* isolate) {
   static EnableStagedWasmFeatures one_time_enable_staged_features(isolate);
 }
 
-void WasmExecutionFuzzer::FuzzWasmModule(Vector<const uint8_t> data,
+void WasmExecutionFuzzer::FuzzWasmModule(base::Vector<const uint8_t> data,
                                          bool require_valid) {
   v8_fuzzer::FuzzerSupport* support = v8_fuzzer::FuzzerSupport::Get();
   v8::Isolate* isolate = support->GetIsolate();
@@ -381,7 +448,7 @@ void WasmExecutionFuzzer::FuzzWasmModule(Vector<const uint8_t> data,
     FlagScope<int> tier_mask_scope(&FLAG_wasm_tier_mask_for_testing, tier_mask);
     FlagScope<int> debug_mask_scope(&FLAG_wasm_debug_mask_for_testing,
                                     debug_mask);
-    compiled_module = i_isolate->wasm_engine()->SyncCompile(
+    compiled_module = GetWasmEngine()->SyncCompile(
         i_isolate, enabled_features, &interpreter_thrower, wire_bytes);
   }
   bool compiles = !compiled_module.is_null();
@@ -390,8 +457,8 @@ void WasmExecutionFuzzer::FuzzWasmModule(Vector<const uint8_t> data,
     GenerateTestCase(i_isolate, wire_bytes, compiles);
   }
 
-  bool validates = i_isolate->wasm_engine()->SyncValidate(
-      i_isolate, enabled_features, wire_bytes);
+  bool validates =
+      GetWasmEngine()->SyncValidate(i_isolate, enabled_features, wire_bytes);
 
   CHECK_EQ(compiles, validates);
   CHECK_IMPLIES(require_valid, validates);

@@ -284,6 +284,7 @@ class Object : public TaggedImpl<HeapObjectReferenceType::STRONG, Address> {
   HEAP_OBJECT_TYPE_LIST(IS_TYPE_FUNCTION_DECL)
   IS_TYPE_FUNCTION_DECL(HashTableBase)
   IS_TYPE_FUNCTION_DECL(SmallOrderedHashTable)
+  IS_TYPE_FUNCTION_DECL(CodeT)
 #undef IS_TYPE_FUNCTION_DECL
   V8_INLINE bool IsNumber(ReadOnlyRoots roots) const;
 
@@ -336,7 +337,9 @@ class Object : public TaggedImpl<HeapObjectReferenceType::STRONG, Address> {
   V8_EXPORT_PRIVATE static Handle<Object> NewStorageFor(
       Isolate* isolate, Handle<Object> object, Representation representation);
 
-  static Handle<Object> WrapForRead(Isolate* isolate, Handle<Object> object,
+  template <AllocationType allocation_type = AllocationType::kYoung,
+            typename IsolateT>
+  static Handle<Object> WrapForRead(IsolateT* isolate, Handle<Object> object,
                                     Representation representation);
 
   // Returns true if the object is of the correct type to be used as a
@@ -590,8 +593,12 @@ class Object : public TaggedImpl<HeapObjectReferenceType::STRONG, Address> {
   EXPORT_DECL_VERIFIER(Object)
 
 #ifdef VERIFY_HEAP
-  // Verify a pointer is a valid object pointer.
+  // Verify a pointer is a valid (non-Code) object pointer.
+  // When V8_EXTERNAL_CODE_SPACE is enabled Code objects are not allowed.
   static void VerifyPointer(Isolate* isolate, Object p);
+  // Verify a pointer is a valid object pointer.
+  // Code objects are allowed regardless of the V8_EXTERNAL_CODE_SPACE mode.
+  static void VerifyAnyTagged(Isolate* isolate, Object p);
 #endif
 
   inline void VerifyApiCallResultType();
@@ -602,7 +609,7 @@ class Object : public TaggedImpl<HeapObjectReferenceType::STRONG, Address> {
   // Prints this object without details to a message accumulator.
   V8_EXPORT_PRIVATE void ShortPrint(StringStream* accumulator) const;
 
-  V8_EXPORT_PRIVATE void ShortPrint(std::ostream& os) const;  // NOLINT
+  V8_EXPORT_PRIVATE void ShortPrint(std::ostream& os) const;
 
   inline static Object cast(Object object) { return object; }
   inline static Object unchecked_cast(Object object) { return object; }
@@ -615,10 +622,10 @@ class Object : public TaggedImpl<HeapObjectReferenceType::STRONG, Address> {
   V8_EXPORT_PRIVATE void Print() const;
 
   // Prints this object with details.
-  V8_EXPORT_PRIVATE void Print(std::ostream& os) const;  // NOLINT
+  V8_EXPORT_PRIVATE void Print(std::ostream& os) const;
 #else
   void Print() const { ShortPrint(); }
-  void Print(std::ostream& os) const { ShortPrint(os); }  // NOLINT
+  void Print(std::ostream& os) const { ShortPrint(os); }
 #endif
 
   // For use with std::unordered_set.
@@ -673,8 +680,7 @@ class Object : public TaggedImpl<HeapObjectReferenceType::STRONG, Address> {
   inline void InitExternalPointerField(size_t offset, Isolate* isolate);
   inline void InitExternalPointerField(size_t offset, Isolate* isolate,
                                        Address value, ExternalPointerTag tag);
-  inline Address ReadExternalPointerField(size_t offset,
-                                          PtrComprCageBase isolate_root,
+  inline Address ReadExternalPointerField(size_t offset, Isolate* isolate,
                                           ExternalPointerTag tag) const;
   inline void WriteExternalPointerField(size_t offset, Isolate* isolate,
                                         Address value, ExternalPointerTag tag);
@@ -777,6 +783,23 @@ class MapWord {
   inline HeapObject ToForwardingAddress();
 
   inline Address ptr() { return value_; }
+
+#ifdef V8_MAP_PACKING
+  static constexpr Address Pack(Address map) {
+    return map ^ Internals::kMapWordXorMask;
+  }
+  static constexpr Address Unpack(Address mapword) {
+    // TODO(wenyuzhao): Clear header metadata.
+    return mapword ^ Internals::kMapWordXorMask;
+  }
+  static constexpr bool IsPacked(Address mapword) {
+    return (static_cast<intptr_t>(mapword) & Internals::kMapWordXorMask) ==
+               Internals::kMapWordSignature &&
+           (0xffffffff00000000 & static_cast<intptr_t>(mapword)) != 0;
+  }
+#else
+  static constexpr bool IsPacked(Address) { return false; }
+#endif
 
  private:
   // HeapObject calls the private constructor and directly reads the value.

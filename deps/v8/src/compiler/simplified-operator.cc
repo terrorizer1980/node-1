@@ -37,8 +37,8 @@ std::ostream& operator<<(std::ostream& os, BaseTaggedness base_taggedness) {
 std::ostream& operator<<(std::ostream& os,
                          ConstFieldInfo const& const_field_info) {
   if (const_field_info.IsConst()) {
-    return os << "const (field owner: " << const_field_info.owner_map.address()
-              << ")";
+    return os << "const (field owner: "
+              << Brief(*const_field_info.owner_map.ToHandleChecked()) << ")";
   } else {
     return os << "mutable";
   }
@@ -523,7 +523,6 @@ Handle<Map> DoubleMapParameterOf(const Operator* op) {
         .double_map();
   }
   UNREACHABLE();
-  return Handle<Map>::null();
 }
 
 Type ValueTypeParameterOf(const Operator* op) {
@@ -540,7 +539,6 @@ Handle<Map> FastMapParameterOf(const Operator* op) {
         .fast_map();
   }
   UNREACHABLE();
-  return Handle<Map>::null();
 }
 
 std::ostream& operator<<(std::ostream& os, BigIntOperationHint hint) {
@@ -613,6 +611,27 @@ NumberOperationParameters const& NumberOperationParametersOf(
     Operator const* op) {
   DCHECK_EQ(IrOpcode::kSpeculativeToNumber, op->opcode());
   return OpParameter<NumberOperationParameters>(op);
+}
+
+bool operator==(SpeculativeBigIntAsUintNParameters const& lhs,
+                SpeculativeBigIntAsUintNParameters const& rhs) {
+  return lhs.bits() == rhs.bits() && lhs.feedback() == rhs.feedback();
+}
+
+size_t hash_value(SpeculativeBigIntAsUintNParameters const& p) {
+  FeedbackSource::Hash feedback_hash;
+  return base::hash_combine(p.bits(), feedback_hash(p.feedback()));
+}
+
+std::ostream& operator<<(std::ostream& os,
+                         SpeculativeBigIntAsUintNParameters const& p) {
+  return os << p.bits() << ", " << p.feedback();
+}
+
+SpeculativeBigIntAsUintNParameters const& SpeculativeBigIntAsUintNParametersOf(
+    Operator const* op) {
+  DCHECK_EQ(IrOpcode::kSpeculativeBigIntAsUintN, op->opcode());
+  return OpParameter<SpeculativeBigIntAsUintNParameters>(op);
 }
 
 size_t hash_value(AllocateParameters info) {
@@ -1296,11 +1315,14 @@ const Operator* SimplifiedOperatorBuilder::RuntimeAbort(AbortReason reason) {
       static_cast<int>(reason));                // parameter
 }
 
-const Operator* SimplifiedOperatorBuilder::BigIntAsUintN(int bits) {
+const Operator* SimplifiedOperatorBuilder::SpeculativeBigIntAsUintN(
+    int bits, const FeedbackSource& feedback) {
   CHECK(0 <= bits && bits <= 64);
 
-  return zone()->New<Operator1<int>>(IrOpcode::kBigIntAsUintN, Operator::kPure,
-                                     "BigIntAsUintN", 1, 0, 0, 1, 0, 0, bits);
+  return zone()->New<Operator1<SpeculativeBigIntAsUintNParameters>>(
+      IrOpcode::kSpeculativeBigIntAsUintN, Operator::kNoProperties,
+      "SpeculativeBigIntAsUintN", 1, 1, 1, 1, 1, 0,
+      SpeculativeBigIntAsUintNParameters(bits, feedback));
 }
 
 const Operator* SimplifiedOperatorBuilder::UpdateInterruptBudget(int delta) {
@@ -1316,10 +1338,16 @@ const Operator* SimplifiedOperatorBuilder::TierUpCheck() {
 }
 
 const Operator* SimplifiedOperatorBuilder::AssertType(Type type) {
-  DCHECK(type.IsRange());
+  DCHECK(type.CanBeAsserted());
   return zone()->New<Operator1<Type>>(IrOpcode::kAssertType,
                                       Operator::kNoThrow | Operator::kNoDeopt,
                                       "AssertType", 1, 0, 0, 1, 0, 0, type);
+}
+
+const Operator* SimplifiedOperatorBuilder::VerifyType() {
+  return zone()->New<Operator>(IrOpcode::kVerifyType,
+                               Operator::kNoThrow | Operator::kNoDeopt,
+                               "VerifyType", 1, 0, 0, 1, 0, 0);
 }
 
 const Operator* SimplifiedOperatorBuilder::CheckIf(
@@ -1516,7 +1544,6 @@ const Operator* SimplifiedOperatorBuilder::ConvertReceiver(
       return &cache_.kConvertReceiverNotNullOrUndefinedOperator;
   }
   UNREACHABLE();
-  return nullptr;
 }
 
 const Operator* SimplifiedOperatorBuilder::CheckFloat64Hole(
@@ -1850,7 +1877,6 @@ const Operator* SimplifiedOperatorBuilder::SpeculativeNumberEqual(
       return &cache_.kSpeculativeNumberEqualNumberOrOddballOperator;
   }
   UNREACHABLE();
-  return nullptr;
 }
 
 #define ACCESS_OP_LIST(V)                                                \

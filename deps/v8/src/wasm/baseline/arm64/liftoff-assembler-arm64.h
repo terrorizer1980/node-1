@@ -126,13 +126,23 @@ inline CPURegister AcquireByType(UseScratchRegisterScope* temps,
 template <typename T>
 inline MemOperand GetMemOp(LiftoffAssembler* assm,
                            UseScratchRegisterScope* temps, Register addr,
-                           Register offset, T offset_imm) {
+                           Register offset, T offset_imm,
+                           bool i64_offset = false) {
   if (offset.is_valid()) {
-    if (offset_imm == 0) return MemOperand(addr.X(), offset.W(), UXTW);
-    Register tmp = temps->AcquireX();
+    if (offset_imm == 0) {
+      return i64_offset ? MemOperand(addr.X(), offset.X())
+                        : MemOperand(addr.X(), offset.W(), UXTW);
+    }
     DCHECK_GE(kMaxUInt32, offset_imm);
-    assm->Add(tmp, offset.X(), offset_imm);
-    return MemOperand(addr.X(), tmp);
+    if (i64_offset) {
+      Register tmp = temps->AcquireX();
+      assm->Add(tmp, offset.X(), offset_imm);
+      return MemOperand(addr.X(), tmp);
+    } else {
+      Register tmp = temps->AcquireW();
+      assm->Add(tmp, offset.W(), offset_imm);
+      return MemOperand(addr.X(), tmp, UXTW);
+    }
   }
   return MemOperand(addr.X(), offset_imm);
 }
@@ -329,7 +339,7 @@ void LiftoffAssembler::PatchPrepareStackFrame(int offset) {
 #endif
   PatchingAssembler patching_assembler(AssemblerOptions{},
                                        buffer_start_ + offset, 1);
-#if V8_OS_WIN
+#if V8_TARGET_OS_WIN
   if (frame_size > kStackPageSize) {
     // Generate OOL code (at the end of the function, where the current
     // assembler is pointing) to do the explicit stack limit check (see
@@ -430,6 +440,8 @@ void LiftoffAssembler::SpillInstance(Register instance) {
   Str(instance, liftoff::GetInstanceOperand());
 }
 
+void LiftoffAssembler::ResetOSRTarget() {}
+
 void LiftoffAssembler::FillInstanceInto(Register dst) {
   Ldr(dst, liftoff::GetInstanceOperand());
 }
@@ -464,7 +476,7 @@ void LiftoffAssembler::StoreTaggedPointer(Register dst_addr,
       liftoff::GetMemOp(this, &temps, dst_addr, offset_reg, offset_imm);
   StoreTaggedField(src.gp(), dst_op);
 
-  if (skip_write_barrier) return;
+  if (skip_write_barrier || FLAG_disable_write_barriers) return;
 
   // The write barrier.
   Label write_barrier;
@@ -479,21 +491,23 @@ void LiftoffAssembler::StoreTaggedPointer(Register dst_addr,
   }
   CheckPageFlag(src.gp(), MemoryChunk::kPointersToHereAreInterestingMask, ne,
                 &exit);
-  CallRecordWriteStub(
+  CallRecordWriteStubSaveRegisters(
       dst_addr,
       dst_op.IsRegisterOffset() ? Operand(dst_op.regoffset().X())
                                 : Operand(dst_op.offset()),
-      EMIT_REMEMBERED_SET, kSaveFPRegs, wasm::WasmCode::kRecordWrite);
+      RememberedSetAction::kEmit, SaveFPRegsMode::kSave,
+      StubCallMode::kCallWasmRuntimeStub);
   bind(&exit);
 }
 
 void LiftoffAssembler::Load(LiftoffRegister dst, Register src_addr,
                             Register offset_reg, uintptr_t offset_imm,
                             LoadType type, LiftoffRegList pinned,
-                            uint32_t* protected_load_pc, bool is_load_mem) {
+                            uint32_t* protected_load_pc, bool is_load_mem,
+                            bool i64_offset) {
   UseScratchRegisterScope temps(this);
-  MemOperand src_op =
-      liftoff::GetMemOp(this, &temps, src_addr, offset_reg, offset_imm);
+  MemOperand src_op = liftoff::GetMemOp(this, &temps, src_addr, offset_reg,
+                                        offset_imm, i64_offset);
   if (protected_load_pc) *protected_load_pc = pc_offset();
   switch (type.value()) {
     case LoadType::kI32Load8U:
@@ -1333,7 +1347,7 @@ bool LiftoffAssembler::emit_type_conversion(WasmOpcode opcode,
                                             LiftoffRegister src, Label* trap) {
   switch (opcode) {
     case kExprI32ConvertI64:
-      if (src != dst) Mov(dst.gp().W(), src.gp().W());
+      Mov(dst.gp().W(), src.gp().W());
       return true;
     case kExprI32SConvertF32:
       Fcvtzs(dst.gp().W(), src.fp().S());  // f32 -> i32 round to zero.
@@ -2834,7 +2848,7 @@ void LiftoffAssembler::emit_f64x2_le(LiftoffRegister dst, LiftoffRegister lhs,
 void LiftoffAssembler::emit_s128_const(LiftoffRegister dst,
                                        const uint8_t imms[16]) {
   uint64_t vals[2];
-  base::Memcpy(vals, imms, sizeof(vals));
+  memcpy(vals, imms, sizeof(vals));
   Movi(dst.fp().V16B(), vals[1], vals[0]);
 }
 
@@ -3219,6 +3233,13 @@ void LiftoffAssembler::DeallocateStackSlot(uint32_t size) {
   // The stack pointer is required to be quadword aligned.
   size = RoundUp(size, kQuadWordSizeInBytes);
   Drop(size, 1);
+}
+
+void LiftoffAssembler::MaybeOSR() {}
+
+void LiftoffAssembler::emit_set_if_nan(Register dst, DoubleRegister src,
+                                       ValueKind kind) {
+  UNIMPLEMENTED();
 }
 
 void LiftoffStackSlots::Construct(int param_slots) {
